@@ -1,0 +1,40 @@
+name: 自动同步上游代码
+
+on:
+  # 计划任务：每天北京时间凌晨 2 点检查一次 (UTC 18:00)
+  schedule:
+    - cron: '0 18 * * *'
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    name: Sync latest commits from upstream repo
+
+    steps:
+    # 1. 标准检出步骤
+    - name: Checkout target repo
+      uses: actions/checkout@v4
+      
+    # 2. 使用第三方 Action 同步代码
+    # 这里使用 aormsby/Fork-Sync-With-Upstream-action，非常成熟好用
+    - name: Sync upstream changes
+      id: sync
+      uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+      with:
+        # 【重要】请修改为原作者的仓库地址 (格式: 作者/项目名)
+        upstream_sync_repo: justlovemaki/AIClient-2-API
+        # 原作者的主分支名 (通常是 main 或 master)
+        upstream_sync_branch: main
+        # 你自己仓库的主分支名
+        target_sync_branch: main
+        # 【关键】使用我们刚才配置的 PAT，这样同步后的 push 才能触发 docker 构建
+        target_repo_token: ${{ secrets.ACTION_TOKEN }}
+        # 设置为 false 表示真跑，设置为 true 只是测试
+        test_mode: false
+
+    # 3. (可选) 打印同步结果
+    - name: New commits found
+      if: steps.sync.outputs.has_new_commits == 'true'
+      run: echo "发现新代码，已同步！即将触发构建..."
