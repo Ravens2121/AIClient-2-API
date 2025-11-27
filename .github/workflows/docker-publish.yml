@@ -1,0 +1,67 @@
+name: 自动构建 Docker 镜像
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 1. 拉取代码
+        uses: actions/checkout@v4
+
+      # 优化后的版本号生成逻辑
+      - name: 2. 生成版本号 (日期-时分)
+        id: date_version
+        run: |
+          TZ=Asia/Shanghai
+          # 生成日期: 251127
+          DATE_STR=$(date +'%y%m%d')
+          # 生成时间: 1030 (表示10点30分)
+          # 这样就替代了 run_number，解决了数字无限累加的问题，同时保证每天重置
+          TIME_STR=$(date +'%H%M')
+          
+          VERSION="${DATE_STR}-${TIME_STR}"
+          
+          echo "本次构建版本: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: 3. 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 4. 登录 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 5. 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ env.VERSION }}
+
+      - name: 6. 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
