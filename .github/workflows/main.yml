@@ -1,0 +1,92 @@
+name: 自动构建 Docker 镜像
+
+# 触发条件配置
+on:
+  # 1. 当代码推送到 main 分支时触发
+  # (包括你在 GitHub 页面点击 "Sync Fork" 同步上游代码时，也会算作 push，从而自动触发)
+  push:
+    branches: [ "main" ]
+  
+  # 2. 允许手动点击按钮触发构建 (方便测试)
+  workflow_dispatch:
+
+# 环境变量配置
+env:
+  REGISTRY: ghcr.io
+  # 镜像名称默认使用 "用户名/仓库名"
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    # 权限设置：非常重要！
+    # 允许读取代码 (contents: read) 和 推送镜像包 (packages: write)
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 第一步：把代码拉取到构建环境
+      - name: 1. 拉取代码
+        uses: actions/checkout@v4
+
+      # 第二步：生成自定义的时间版本号 (YYMMDD + GitHub运行编号)
+      # 逻辑：获取当前日期(251127) + 本次Action的运行ID(例如01)
+      # 结果示例：TAG_NAME=251127-15
+      - name: 2. 生成版本号
+        id: date_version
+        run: |
+          # 设置时区为上海，确保日期正确
+          TZ=Asia/Shanghai
+          # 生成日期部分：251127
+          DATE_STR=$(date +'%y%m%d')
+          # 组合版本号：日期 + GitHub运行编号 (确保每次构建唯一且递增)
+          # 注意：run_number 是全局累加的，无法每天自动重置为01，但能保证唯一和递增，是最简单稳定的方案。
+          VERSION="${DATE_STR}${github.run_number}"
+          
+          echo "本次构建版本: $VERSION"
+          # 将版本号写入环境变量，供后续步骤使用
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # 第三步：配置 Docker 构建环境 (Buildx)
+      # 这是构建多架构镜像或使用缓存所必须的工具
+      - name: 3. 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 第四步：登录 GitHub 容器仓库 (GHCR)
+      # 使用 GitHub 自动提供的临时 Token 登录，无需手动设置密码
+      - name: 4. 登录 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 第五步：提取并生成 Docker 标签 (Tags)
+      # 这里我们配置两个标签：
+      # 1. latest (表示最新)
+      # 2. 我们自定义的日期版本号 (例如 25112715)
+      - name: 5. 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ env.VERSION }}
+
+      # 第六步：正式构建并推送
+      - name: 6. 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # Dockerfile 路径，如果不在根目录请修改这里，例如 ./server/Dockerfile
+          file: ./Dockerfile
+          push: true
+          # 使用上一步生成的标签 (latest 和 日期版本)
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 使用缓存机制，加快第二次构建的速度
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
