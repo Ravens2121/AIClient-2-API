@@ -1,0 +1,41 @@
+name: 自动同步上游代码
+
+on:
+  # 计划任务：每 4 小时检查一次 (0:00, 4:00, 8:00...)
+  schedule:
+    - cron: '0 */4 * * *'
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    name: Sync latest commits from upstream repo
+    steps:
+    # 1. 标准检出步骤
+    - name: Checkout target repo
+      uses: actions/checkout@v4
+
+    # 2. 同步上游代码
+    - name: Sync upstream changes
+      id: sync
+      uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+      with:
+        upstream_sync_repo: justlovemaki/AIClient-2-API
+        upstream_sync_branch: main
+        target_sync_branch: main
+        target_repo_token: ${{ secrets.ACTION_TOKEN }}
+        test_mode: false
+
+    # 3. (关键修改) 只有在发现新代码时，才发送构建信号
+    - name: Trigger Docker Build
+      if: steps.sync.outputs.has_new_commits == 'true'
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        token: ${{ secrets.ACTION_TOKEN }}
+        event-type: trigger-docker-build
+        client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
+
+    - name: Show sync result
+      if: steps.sync.outputs.has_new_commits == 'true'
+      run: echo "发现新代码并已同步，已发送 trigger-docker-build 信号！"
