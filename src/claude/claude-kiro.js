@@ -4,6 +4,8 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import * as http from 'http';
+import * as https from 'https';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
 
@@ -281,8 +283,24 @@ export class KiroApiService {
         console.log('[Kiro] Initializing Kiro API Service...');
         await this.initializeAuth();
         const macSha256 = await getMacAddressSha256();
+        // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
+        const httpAgent = new http.Agent({
+            keepAlive: true,
+            maxSockets: 200,        // 每个主机最多 10 个连接
+            maxFreeSockets: 5,     // 最多保留 5 个空闲连接
+            timeout: 60000,        // 空闲连接 60 秒后关闭
+        });
+        const httpsAgent = new https.Agent({
+            keepAlive: true,
+            maxSockets: 100,
+            maxFreeSockets: 5,
+            timeout: 60000,
+        });
+        
         const axiosConfig = {
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
+            httpAgent,
+            httpsAgent,
             headers: {
                 'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
                 'x-amz-user-agent': `aws-sdk-js/1.0.7 KiroIDE-0.1.25-${macSha256}`,
@@ -637,7 +655,16 @@ async initializeAuth(forceRefresh = false) {
                     userInputMessage.images = images;
                 }
                 if (toolResults.length > 0) {
-                    userInputMessage.userInputMessageContext = { toolResults };
+                    // 去重 toolResults - Kiro API 不接受重复的 toolUseId
+                    const uniqueToolResults = [];
+                    const seenIds = new Set();
+                    for (const tr of toolResults) {
+                        if (!seenIds.has(tr.toolUseId)) {
+                            seenIds.add(tr.toolUseId);
+                            uniqueToolResults.push(tr);
+                        }
+                    }
+                    userInputMessage.userInputMessageContext = { toolResults: uniqueToolResults };
                 }
                 
                 history.push({ userInputMessage });
@@ -742,8 +769,9 @@ async initializeAuth(forceRefresh = false) {
                 currentContent = this.getContentText(currentMessage);
             }
 
-            if (!currentContent && currentToolResults.length === 0 && currentToolUses.length === 0) {
-                currentContent = 'Continue';
+            // Kiro API 要求 content 不能为空，即使有 toolResults
+            if (!currentContent) {
+                currentContent = currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue';
             }
         }
 
@@ -751,10 +779,14 @@ async initializeAuth(forceRefresh = false) {
             conversationState: {
                 chatTriggerType: KIRO_CONSTANTS.CHAT_TRIGGER_TYPE_MANUAL,
                 conversationId: conversationId,
-                currentMessage: {}, // Will be populated as userInputMessage
-                history: history
+                currentMessage: {} // Will be populated as userInputMessage
             }
         };
+        
+        // 只有当 history 非空时才添加（API 可能不接受空数组）
+        if (history.length > 0) {
+            request.conversationState.history = history;
+        }
 
         // currentMessage 始终是 userInputMessage 类型
         // 注意：API 不接受 null 值，空字段应该完全不包含
@@ -772,7 +804,16 @@ async initializeAuth(forceRefresh = false) {
         // 构建 userInputMessageContext，只包含非空字段
         const userInputMessageContext = {};
         if (currentToolResults.length > 0) {
-            userInputMessageContext.toolResults = currentToolResults;
+            // 去重 toolResults - Kiro API 不接受重复的 toolUseId
+            const uniqueToolResults = [];
+            const seenToolUseIds = new Set();
+            for (const tr of currentToolResults) {
+                if (!seenToolUseIds.has(tr.toolUseId)) {
+                    seenToolUseIds.add(tr.toolUseId);
+                    uniqueToolResults.push(tr);
+                }
+            }
+            userInputMessageContext.toolResults = uniqueToolResults;
         }
         if (Object.keys(toolsContext).length > 0 && toolsContext.tools) {
             userInputMessageContext.tools = toolsContext.tools;
@@ -1022,25 +1063,67 @@ async initializeAuth(forceRefresh = false) {
         let searchStart = 0;
         
         while (true) {
-            // 查找 {"content": 或 {"toolUse" 的起始位置
+            // 查找真正的 JSON payload 起始位置
+            // AWS Event Stream 包含二进制头部，我们只搜索有效的 JSON 模式
+            // Kiro 返回格式: {"content":"..."} 或 {"name":"xxx","toolUseId":"xxx",...} 或 {"followupPrompt":"..."}
+            
+            // 搜索所有可能的 JSON payload 开头模式
+            // Kiro 返回的 toolUse 可能分多个事件：
+            // 1. {"name":"xxx","toolUseId":"xxx"} - 开始
+            // 2. {"input":"..."} - input 数据（可能多次）
+            // 3. {"stop":true} - 结束
             const contentStart = remaining.indexOf('{"content":', searchStart);
-            const toolUseStart = remaining.indexOf('{"toolUse":', searchStart);
+            const nameStart = remaining.indexOf('{"name":', searchStart);
+            const followupStart = remaining.indexOf('{"followupPrompt":', searchStart);
+            const inputStart = remaining.indexOf('{"input":', searchStart);
+            const stopStart = remaining.indexOf('{"stop":', searchStart);
             
-            let jsonStart = -1;
-            if (contentStart >= 0 && toolUseStart >= 0) {
-                jsonStart = Math.min(contentStart, toolUseStart);
-            } else if (contentStart >= 0) {
-                jsonStart = contentStart;
-            } else if (toolUseStart >= 0) {
-                jsonStart = toolUseStart;
-            }
+            // 找到最早出现的有效 JSON 模式
+            const candidates = [contentStart, nameStart, followupStart, inputStart, stopStart].filter(pos => pos >= 0);
+            if (candidates.length === 0) break;
             
+            const jsonStart = Math.min(...candidates);
             if (jsonStart < 0) break;
             
-            // 查找对应的 } 结束位置
-            const jsonEnd = remaining.indexOf('}', jsonStart);
+            // 正确处理嵌套的 {} - 使用括号计数法
+            let braceCount = 0;
+            let jsonEnd = -1;
+            let inString = false;
+            let escapeNext = false;
+            
+            for (let i = jsonStart; i < remaining.length; i++) {
+                const char = remaining[i];
+                
+                if (escapeNext) {
+                    escapeNext = false;
+                    continue;
+                }
+                
+                if (char === '\\') {
+                    escapeNext = true;
+                    continue;
+                }
+                
+                if (char === '"') {
+                    inString = !inString;
+                    continue;
+                }
+                
+                if (!inString) {
+                    if (char === '{') {
+                        braceCount++;
+                    } else if (char === '}') {
+                        braceCount--;
+                        if (braceCount === 0) {
+                            jsonEnd = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            
             if (jsonEnd < 0) {
-                // 不完整的 JSON，保留在缓冲区
+                // 不完整的 JSON，保留在缓冲区等待更多数据
                 remaining = remaining.substring(jsonStart);
                 break;
             }
@@ -1048,13 +1131,45 @@ async initializeAuth(forceRefresh = false) {
             const jsonStr = remaining.substring(jsonStart, jsonEnd + 1);
             try {
                 const parsed = JSON.parse(jsonStr);
-                if (parsed.content !== undefined) {
-                    events.push({ type: 'content', data: parsed.content });
-                } else if (parsed.toolUse !== undefined) {
-                    events.push({ type: 'toolUse', data: parsed.toolUse });
+                // 处理 content 事件
+                if (parsed.content !== undefined && !parsed.followupPrompt) {
+                    // 处理转义字符
+                    let decodedContent = parsed.content;
+                    decodedContent = decodedContent.replace(/(?<!\\)\\n/g, '\n');
+                    events.push({ type: 'content', data: decodedContent });
+                }
+                // 处理结构化工具调用事件 - 开始事件（包含 name 和 toolUseId）
+                else if (parsed.name && parsed.toolUseId) {
+                    events.push({ 
+                        type: 'toolUse', 
+                        data: {
+                            name: parsed.name,
+                            toolUseId: parsed.toolUseId,
+                            input: parsed.input || '',
+                            stop: parsed.stop || false
+                        }
+                    });
+                }
+                // 处理工具调用的 input 续传事件（只有 input 字段）
+                else if (parsed.input !== undefined && !parsed.name) {
+                    events.push({
+                        type: 'toolUseInput',
+                        data: {
+                            input: parsed.input
+                        }
+                    });
+                }
+                // 处理工具调用的结束事件（只有 stop 字段）
+                else if (parsed.stop !== undefined) {
+                    events.push({
+                        type: 'toolUseStop',
+                        data: {
+                            stop: parsed.stop
+                        }
+                    });
                 }
             } catch (e) {
-                // JSON 解析失败，可能是不完整的，继续搜索
+                // JSON 解析失败，跳过这个位置继续搜索
             }
             
             searchStart = jsonEnd + 1;
@@ -1090,15 +1205,16 @@ async initializeAuth(forceRefresh = false) {
 
         const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
+        let stream = null;
         try {
             const response = await this.axiosInstance.post(requestUrl, requestData, { 
                 headers,
                 responseType: 'stream'
             });
 
-            const stream = response.data;
+            stream = response.data;
             let buffer = '';
-            const processedPositions = new Set();  // 避免重复处理
+            let lastContentEvent = null;  // 用于检测连续重复的 content 事件
 
             for await (const chunk of stream) {
                 buffer += chunk.toString();
@@ -1107,20 +1223,31 @@ async initializeAuth(forceRefresh = false) {
                 const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
                 buffer = remaining;
                 
-                // 只 yield 新的事件
+                // yield 所有事件，但过滤连续完全相同的 content 事件（Kiro API 有时会重复发送）
                 for (const event of events) {
-                    const eventKey = `${event.type}:${event.data}`;
-                    if (!processedPositions.has(eventKey)) {
-                        processedPositions.add(eventKey);
-                        if (event.type === 'content' && event.data) {
-                            yield { type: 'content', content: event.data };
-                        } else if (event.type === 'toolUse') {
-                            yield { type: 'toolUse', toolUse: event.data };
+                    if (event.type === 'content' && event.data) {
+                        // 检查是否与上一个 content 事件完全相同
+                        if (lastContentEvent === event.data) {
+                            // 跳过重复的内容
+                            continue;
                         }
+                        lastContentEvent = event.data;
+                        yield { type: 'content', content: event.data };
+                    } else if (event.type === 'toolUse') {
+                        yield { type: 'toolUse', toolUse: event.data };
+                    } else if (event.type === 'toolUseInput') {
+                        yield { type: 'toolUseInput', input: event.data.input };
+                    } else if (event.type === 'toolUseStop') {
+                        yield { type: 'toolUseStop', stop: event.data.stop };
                     }
                 }
             }
         } catch (error) {
+            // 确保出错时关闭流
+            if (stream && typeof stream.destroy === 'function') {
+                stream.destroy();
+            }
+            
             if (error.response?.status === 403 && !isRetry) {
                 console.log('[Kiro] Received 403 in stream. Attempting token refresh and retrying...');
                 await this.initializeAuth(true);
@@ -1138,6 +1265,11 @@ async initializeAuth(forceRefresh = false) {
 
             console.error('[Kiro] Stream API call failed:', error.message);
             throw error;
+        } finally {
+            // 确保流被关闭，释放资源
+            if (stream && typeof stream.destroy === 'function') {
+                stream.destroy();
+            }
         }
     }
 
@@ -1191,12 +1323,13 @@ async initializeAuth(forceRefresh = false) {
             let totalContent = '';
             let outputTokens = 0;
             const toolCalls = [];
+            let currentToolCall = null;  // 用于累积结构化工具调用
 
             // 3. 流式接收并发送每个 content_block_delta
             for await (const event of this.streamApiReal('', finalModel, requestBody)) {
                 if (event.type === 'content' && event.content) {
                     totalContent += event.content;
-                    outputTokens += this.countTextTokens(event.content);
+                    // 不再每个 chunk 都计算 token，改为最后统一计算，避免阻塞事件循环
                     
                     yield {
                         type: "content_block_delta",
@@ -1204,7 +1337,77 @@ async initializeAuth(forceRefresh = false) {
                         delta: { type: "text_delta", text: event.content }
                     };
                 } else if (event.type === 'toolUse') {
-                    toolCalls.push(event.toolUse);
+                    const tc = event.toolUse;
+                    // 工具调用事件（包含 name 和 toolUseId）
+                    if (tc.name && tc.toolUseId) {
+                        // 检查是否是同一个工具调用的续传（相同 toolUseId）
+                        if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
+                            // 同一个工具调用，累积 input
+                            currentToolCall.input += tc.input || '';
+                        } else {
+                            // 不同的工具调用
+                            // 如果有未完成的工具调用，先保存它
+                            if (currentToolCall) {
+                                try {
+                                    currentToolCall.input = JSON.parse(currentToolCall.input);
+                                } catch (e) {
+                                    // input 不是有效 JSON，保持原样
+                                }
+                                toolCalls.push(currentToolCall);
+                            }
+                            // 开始新的工具调用
+                            currentToolCall = {
+                                toolUseId: tc.toolUseId,
+                                name: tc.name,
+                                input: tc.input || ''
+                            };
+                        }
+                        // 如果这个事件包含 stop，完成工具调用
+                        if (tc.stop) {
+                            try {
+                                currentToolCall.input = JSON.parse(currentToolCall.input);
+                            } catch (e) {}
+                            toolCalls.push(currentToolCall);
+                            currentToolCall = null;
+                        }
+                    }
+                } else if (event.type === 'toolUseInput') {
+                    // 工具调用的 input 续传事件
+                    if (currentToolCall) {
+                        currentToolCall.input += event.input || '';
+                    }
+                } else if (event.type === 'toolUseStop') {
+                    // 工具调用结束事件
+                    if (currentToolCall && event.stop) {
+                        try {
+                            currentToolCall.input = JSON.parse(currentToolCall.input);
+                        } catch (e) {
+                            // input 不是有效 JSON，保持原样
+                        }
+                        toolCalls.push(currentToolCall);
+                        currentToolCall = null;
+                    }
+                }
+            }
+            
+            // 处理未完成的工具调用（如果流提前结束）
+            if (currentToolCall) {
+                try {
+                    currentToolCall.input = JSON.parse(currentToolCall.input);
+                } catch (e) {}
+                toolCalls.push(currentToolCall);
+                currentToolCall = null;
+            }
+            
+            // 检查文本内容中的 bracket 格式工具调用
+            const bracketToolCalls = parseBracketToolCalls(totalContent);
+            if (bracketToolCalls && bracketToolCalls.length > 0) {
+                for (const btc of bracketToolCalls) {
+                    toolCalls.push({
+                        toolUseId: btc.id || `tool_${uuidv4()}`,
+                        name: btc.function.name,
+                        input: JSON.parse(btc.function.arguments || '{}')
+                    });
                 }
             }
 
@@ -1233,7 +1436,7 @@ async initializeAuth(forceRefresh = false) {
                         index: blockIndex,
                         delta: {
                             type: "input_json_delta",
-                            partial_json: JSON.stringify(tc.input || {})
+                            partial_json: typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input || {})
                         }
                     };
                     
@@ -1242,6 +1445,12 @@ async initializeAuth(forceRefresh = false) {
             }
 
             // 6. 发送 message_delta 事件
+            // 在流结束后统一计算 output tokens，避免在流式循环中阻塞事件循环
+            outputTokens = this.countTextTokens(totalContent);
+            for (const tc of toolCalls) {
+                outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
+            }
+            
             yield {
                 type: "message_delta",
                 delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn" },
